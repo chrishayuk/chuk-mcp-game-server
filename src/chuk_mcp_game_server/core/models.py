@@ -2,7 +2,6 @@
 """
 Core Models
 ===========
-
 Core Pydantic models for the MCP game framework.
 Provides base classes, common types, and framework-wide utilities.
 Updated to work with separated session architecture and Pydantic v2.

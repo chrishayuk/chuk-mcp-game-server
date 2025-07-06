@@ -1,10 +1,17 @@
 # chuk_mcp_game_server/session/game_session_manager.py
 """
-Game Session Manager
-====================
+Game Session Manager - Enhanced (COMPLETELY FIXED)
+==================================================
 
+Enhanced session manager with event system, improved ID generation, and better enum handling.
 Manages multiple game sessions with Pydantic validation and type safety.
 Handles session lifecycle, state persistence, statistics, and cleanup operations.
+
+FIXED ISSUES:
+- Event emission enum handling (no more 'str' object has no attribute 'value' errors)
+- Proper type conversion before event emission
+- Enhanced error handling and validation
+- All enum operations now use safe string conversion
 """
 
 import logging
@@ -16,11 +23,12 @@ from datetime import datetime
 # core models
 from ..core.models import ToolResult, create_success_result, create_error_result
 
-# session models and game session
+# enhanced session models and game session
 from .models import (
     SessionStats, SessionFilter, CleanupCriteria, CleanupResult,
     SessionCreationRequest, SessionListResponse, SessionBulkOperation, 
-    SessionBulkResult, SessionOperation
+    SessionBulkResult, SessionOperation, SessionEvent, EventType, EventHandler,
+    safe_enum_to_string  # Import the safe conversion function
 )
 from .game_session import GameSession
 
@@ -33,15 +41,23 @@ logger = logging.getLogger(__name__)
 
 class GameSessionManager:
     """
-    Manages multiple game sessions with advanced features.
+    Enhanced session manager with bulletproof event system.
+    
+    Features:
+    - Event-driven architecture with customizable handlers
+    - Improved session ID generation  
+    - Bulletproof enum handling and serialization
+    - Enhanced error handling and validation
+    - Performance tracking and monitoring
     
     Provides session lifecycle management, filtering, statistics,
     cleanup operations, and bulk operations.
     """
     
-    def __init__(self, plugin_registry: PluginRegistry = None):
+    def __init__(self, plugin_registry: PluginRegistry = None, event_handler: EventHandler = None):
         self.sessions: Dict[str, GameSession] = {}
         self.plugin_registry = plugin_registry or PluginRegistry()
+        self.event_handler = event_handler
         self.active_session_id: Optional[str] = None
         self.start_time = datetime.now()
         
@@ -50,7 +66,50 @@ class GameSessionManager:
         self._default_session_timeout_hours = 24
         self._default_idle_timeout_hours = 12
         
-        logger.info("Game session manager initialized")
+        # Event tracking
+        self._events_today = 0
+        self._last_event_date = datetime.now().date()
+        
+        logger.info("Enhanced game session manager initialized")
+    
+    # ================================================================== Event System (BULLETPROOF)
+    
+    async def _emit_event(self, event_type, session_id: str = None, 
+                         correlation_id: str = None, **details):
+        """Emit a session event with bulletproof enum handling."""
+        try:
+            # Reset daily counter if needed
+            today = datetime.now().date()
+            if today != self._last_event_date:
+                self._events_today = 0
+                self._last_event_date = today
+            
+            self._events_today += 1
+            
+            # BULLETPROOF enum handling - use the safe conversion function
+            event_type_str = safe_enum_to_string(event_type)
+            
+            # Create event with guaranteed string value
+            event = SessionEvent(
+                event_type=event_type_str,
+                session_id=session_id,
+                correlation_id=correlation_id,
+                details=details
+            )
+            
+            if self.event_handler:
+                await self.event_handler(event)
+            
+            logger.debug(f"Event emitted: {event.to_log_message()}")
+            
+        except Exception as e:
+            logger.error(f"Error emitting event {event_type}: {e}")
+            # Don't re-raise to prevent cascade failures
+    
+    def set_event_handler(self, handler: EventHandler):
+        """Set the event handler for session events."""
+        self.event_handler = handler
+        logger.info("Event handler updated")
     
     # ================================================================== Configuration
     
@@ -70,13 +129,40 @@ class GameSessionManager:
                    f"timeout={self._default_session_timeout_hours}h, "
                    f"idle={self._default_idle_timeout_hours}h")
     
-    # ================================================================== Session Creation
+    # ================================================================== Enhanced Session ID Generation
+    
+    def _generate_session_id(self, game_type: str) -> str:
+        """Generate a more readable and unique session ID."""
+        # Enhanced format: game-MMDDHHMMM-xxxxxx
+        now = datetime.now()
+        date_part = now.strftime("%m%d")  # MMDD
+        time_part = now.strftime("%H%M")  # HHMM
+        short_uuid = uuid.uuid4().hex[:6]  # 6-char hash
+        
+        base_id = f"{game_type}-{date_part}{time_part}-{short_uuid}"
+        
+        # Ensure uniqueness (very unlikely collision, but safety first)
+        counter = 0
+        session_id = base_id
+        while session_id in self.sessions:
+            counter += 1
+            session_id = f"{base_id}-{counter}"
+        
+        return session_id
+    
+    # ================================================================== Enhanced Session Creation
     
     async def create_session(self, request: SessionCreationRequest) -> ToolResult:
-        """Create a new game session with full validation."""
+        """Create a new game session with enhanced validation and events."""
         try:
             # Check session limit
             if len(self.sessions) >= self._max_sessions:
+                await self._emit_event(
+                    EventType.ERROR_OCCURRED,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    error="session_limit_reached",
+                    max_sessions=self._max_sessions
+                )
                 return create_error_result(
                     f"Maximum number of sessions ({self._max_sessions}) reached"
                 )
@@ -85,6 +171,12 @@ class GameSessionManager:
             try:
                 plugin = self.plugin_registry.get(request.game_type)
             except ValueError as e:
+                await self._emit_event(
+                    EventType.ERROR_OCCURRED,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    error="invalid_game_type",
+                    game_type=request.game_type
+                )
                 return create_error_result(str(e))
             
             # Validate game configuration
@@ -96,12 +188,25 @@ class GameSessionManager:
                 }
                 validated_config = plugin.validate_config(full_config)
             except Exception as e:
+                await self._emit_event(
+                    EventType.ERROR_OCCURRED,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    error="config_validation_failed",
+                    game_type=request.game_type,
+                    config=request.config
+                )
                 return create_error_result(f"Configuration validation failed: {str(e)}")
             
-            # Generate session ID if not provided
+            # Generate session ID if not provided (enhanced format)
             session_id = request.session_id or self._generate_session_id(request.game_type)
             
             if session_id in self.sessions:
+                await self._emit_event(
+                    EventType.ERROR_OCCURRED,
+                    session_id=session_id,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    error="session_exists"
+                )
                 return create_error_result(f"Session {session_id} already exists")
             
             # Create initial game state
@@ -109,6 +214,13 @@ class GameSessionManager:
                 state = plugin.create_initial_state(session_id, validated_config)
             except Exception as e:
                 logger.error(f"Error creating initial state for {request.game_type}: {e}")
+                await self._emit_event(
+                    EventType.ERROR_OCCURRED,
+                    session_id=session_id,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    error="state_creation_failed",
+                    game_type=request.game_type
+                )
                 return create_error_result(f"Failed to create game state: {str(e)}")
             
             # Create session
@@ -121,9 +233,21 @@ class GameSessionManager:
             
             self.sessions[session_id] = session
             
-            # Set as active if first session
-            if self.active_session_id is None:
+            # Set as active if requested and no active session exists
+            if request.auto_activate and self.active_session_id is None:
                 self.active_session_id = session_id
+            
+            # Emit creation event if enabled
+            if getattr(request, 'emit_events', True):
+                await self._emit_event(
+                    EventType.SESSION_CREATED,
+                    session_id=session_id,
+                    correlation_id=getattr(request, 'correlation_id', None),
+                    game_type=request.game_type,
+                    tags=request.tags,
+                    auto_activated=request.auto_activate and self.active_session_id == session_id,
+                    message=f"Created {request.game_type} session"
+                )
             
             logger.info(f"Created {request.game_type} session: {session_id}")
             
@@ -131,13 +255,19 @@ class GameSessionManager:
                 message=f"Created {request.game_type} session: {session_id}",
                 data={
                     "session_id": session_id,
-                    "session_info": session.to_info(is_active_session=True).dict(),
+                    "session_info": session.to_info(is_active_session=(session_id == self.active_session_id)).model_dump(),
                     "game_state": session.get_state_snapshot()
                 }
             )
             
         except Exception as e:
             logger.error(f"Unexpected error creating session: {e}")
+            await self._emit_event(
+                EventType.ERROR_OCCURRED,
+                correlation_id=getattr(request, 'correlation_id', None),
+                error="unexpected_error",
+                exception=str(e)
+            )
             return create_error_result(f"Internal error: {str(e)}")
     
     # ================================================================== Session Access
@@ -167,9 +297,9 @@ class GameSessionManager:
             return create_success_result(
                 message="Session info retrieved",
                 data={
-                    "session_info": session.to_info(is_active_session=is_active).dict(),
+                    "session_info": session.to_info(is_active_session=is_active).model_dump(),
                     "game_state": session.get_state_snapshot(),
-                    "plugin_info": plugin.get_game_info().dict(),
+                    "plugin_info": plugin.get_game_info().model_dump(),
                     "session_age_seconds": session.get_age().total_seconds(),
                     "idle_time_seconds": session.get_idle_time().total_seconds(),
                     "config_schema": plugin.get_json_schema(),
@@ -181,10 +311,10 @@ class GameSessionManager:
             logger.error(f"Error getting session info: {e}")
             return create_error_result(f"Internal error: {str(e)}")
     
-    # ================================================================== Session Listing
+    # ================================================================== Enhanced Session Listing
     
     async def list_sessions(self, filter_criteria: SessionFilter = None) -> ToolResult:
-        """List sessions with advanced filtering."""
+        """List sessions with enhanced filtering and enum handling."""
         try:
             if filter_criteria is None:
                 filter_criteria = SessionFilter()
@@ -205,16 +335,17 @@ class GameSessionManager:
             session_infos = []
             for session in filtered_sessions:
                 is_active = session.session_id == self.active_session_id
-                session_infos.append(session.to_info(is_active_session=is_active))
+                info = session.to_info(is_active_session=is_active)
+                session_infos.append(info)
             
             # Sort by last accessed (most recent first)
             session_infos.sort(key=lambda s: s.last_accessed, reverse=True)
             
-            # Generate statistics
-            stats = self._calculate_stats()
+            # Generate enhanced statistics
+            stats = self._calculate_enhanced_stats()
             
             response = SessionListResponse(
-                sessions=[info.dict() for info in session_infos],
+                sessions=session_infos,
                 total_count=len(self.sessions),
                 filtered_count=len(session_infos),
                 stats=stats,
@@ -223,22 +354,23 @@ class GameSessionManager:
             
             return create_success_result(
                 message=f"Found {len(session_infos)} sessions (of {len(self.sessions)} total)",
-                data=response.dict()
+                data=response.model_dump()
             )
             
         except Exception as e:
             logger.error(f"Error listing sessions: {e}")
             return create_error_result(f"Internal error: {str(e)}")
     
-    # ================================================================== Session Management
+    # ================================================================== Enhanced Session Management
     
-    async def delete_session(self, session_id: str) -> ToolResult:
-        """Delete a session."""
+    async def delete_session(self, session_id: str, emit_events: bool = True) -> ToolResult:
+        """Delete a session with event emission."""
         try:
             if session_id not in self.sessions:
                 return create_error_result("Session not found")
             
             session = self.sessions[session_id]
+            game_type = session.game_type
             del self.sessions[session_id]
             
             # Update active session
@@ -247,13 +379,24 @@ class GameSessionManager:
                 new_active = self._select_new_active_session()
                 self.active_session_id = new_active
             
+            # Emit deletion event
+            if emit_events:
+                await self._emit_event(
+                    EventType.SESSION_DELETED,
+                    session_id=session_id,
+                    game_type=game_type,
+                    new_active_session=new_active,
+                    remaining_sessions=len(self.sessions),
+                    message=f"Deleted {game_type} session"
+                )
+            
             logger.info(f"Deleted session: {session_id}")
             
             return create_success_result(
                 message=f"Session {session_id} deleted",
                 data={
                     "deleted_session": session_id,
-                    "deleted_game_type": session.game_type,
+                    "deleted_game_type": game_type,
                     "new_active_session": new_active,
                     "remaining_sessions": len(self.sessions)
                 }
@@ -263,8 +406,8 @@ class GameSessionManager:
             logger.error(f"Error deleting session: {e}")
             return create_error_result(f"Internal error: {str(e)}")
     
-    async def set_active_session(self, session_id: str) -> ToolResult:
-        """Set the active session."""
+    async def set_active_session(self, session_id: str, emit_events: bool = True) -> ToolResult:
+        """Set the active session with event emission."""
         try:
             if session_id not in self.sessions:
                 return create_error_result("Session not found")
@@ -274,6 +417,15 @@ class GameSessionManager:
             
             # Touch the session
             self.sessions[session_id].touch()
+            
+            # Emit activation event
+            if emit_events:
+                await self._emit_event(
+                    EventType.SESSION_ACTIVATED,
+                    session_id=session_id,
+                    previous_active=old_active,
+                    message=f"Session {session_id} activated"
+                )
             
             return create_success_result(
                 message=f"Session {session_id} is now active",
@@ -312,11 +464,12 @@ class GameSessionManager:
             logger.error(f"Error updating session tags: {e}")
             return create_error_result(f"Internal error: {str(e)}")
     
-    # ================================================================== Bulk Operations
+    # ================================================================== Enhanced Bulk Operations
     
-    async def bulk_delete_sessions(self, session_ids: List[str]) -> ToolResult:
-        """Delete multiple sessions in one operation."""
+    async def bulk_delete_sessions(self, session_ids: List[str], emit_events: bool = True) -> ToolResult:
+        """Delete multiple sessions with enhanced event tracking."""
         start_time = time.time()
+        event_id = str(uuid.uuid4()) if emit_events else None
         
         try:
             results = []
@@ -332,36 +485,51 @@ class GameSessionManager:
                         self.active_session_id = self._select_new_active_session()
                     
                     results.append(SessionOperation(
-                        operation_type="delete",
+                        operation_type="bulk_delete",  # Use string directly
                         session_id=session_id,
                         success=True,
                         message=f"Deleted {session.game_type} session",
-                        details={"game_type": session.game_type}
+                        details={"game_type": session.game_type},
+                        event_id=event_id
                     ))
                     successful += 1
                     
                 else:
                     results.append(SessionOperation(
-                        operation_type="delete",
+                        operation_type="bulk_delete",  # Use string directly
                         session_id=session_id,
                         success=False,
-                        message="Session not found"
+                        message="Session not found",
+                        event_id=event_id
                     ))
             
             duration_ms = (time.time() - start_time) * 1000
             
             bulk_result = SessionBulkResult(
-                operation="delete",
+                operation="bulk_delete",  # Use string directly
                 total_requested=len(session_ids),
                 successful=successful,
                 failed=len(session_ids) - successful,
                 results=results,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
+                event_id=event_id
             )
+            
+            # Emit bulk operation event
+            if emit_events:
+                await self._emit_event(
+                    EventType.BULK_OPERATION,
+                    operation="bulk_delete",
+                    successful=successful,
+                    failed=len(session_ids) - successful,
+                    total_requested=len(session_ids),
+                    duration_ms=duration_ms,
+                    message=f"Bulk delete: {successful}/{len(session_ids)} successful"
+                )
             
             return create_success_result(
                 message=f"Bulk delete completed: {successful}/{len(session_ids)} successful",
-                data=bulk_result.dict()
+                data=bulk_result.model_dump()
             )
             
         except Exception as e:
@@ -387,7 +555,7 @@ class GameSessionManager:
                             session.add_tag(tag)
                         
                         results.append(SessionOperation(
-                            operation_type="tag",
+                            operation_type="tag",  # Use string directly
                             session_id=session_id,
                             success=True,
                             message=f"Updated tags for {session.game_type} session",
@@ -401,14 +569,14 @@ class GameSessionManager:
                         
                     except Exception as e:
                         results.append(SessionOperation(
-                            operation_type="tag",
+                            operation_type="tag",  # Use string directly
                             session_id=session_id,
                             success=False,
                             message=f"Failed to update tags: {str(e)}"
                         ))
                 else:
                     results.append(SessionOperation(
-                        operation_type="tag",
+                        operation_type="tag",  # Use string directly
                         session_id=session_id,
                         success=False,
                         message="Session not found"
@@ -417,7 +585,7 @@ class GameSessionManager:
             duration_ms = (time.time() - start_time) * 1000
             
             bulk_result = SessionBulkResult(
-                operation="tag",
+                operation="tag",  # Use string directly
                 total_requested=len(session_ids),
                 successful=successful,
                 failed=len(session_ids) - successful,
@@ -427,14 +595,14 @@ class GameSessionManager:
             
             return create_success_result(
                 message=f"Bulk tag operation completed: {successful}/{len(session_ids)} successful",
-                data=bulk_result.dict()
+                data=bulk_result.model_dump()
             )
             
         except Exception as e:
             logger.error(f"Error in bulk tag operation: {e}")
             return create_error_result(f"Internal error: {str(e)}")
     
-    # ================================================================== Cleanup
+    # ================================================================== Enhanced Cleanup
     
     async def cleanup_sessions(self, criteria: CleanupCriteria = None) -> ToolResult:
         """Clean up sessions based on age and idle time."""
@@ -504,17 +672,17 @@ class GameSessionManager:
             action = "Would delete" if criteria.dry_run else "Deleted"
             return create_success_result(
                 message=f"{action} {len(sessions_to_delete)} sessions",
-                data=result.dict()
+                data=result.model_dump()
             )
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return create_error_result(f"Cleanup failed: {str(e)}")
     
-    # ================================================================== Statistics
+    # ================================================================== Enhanced Statistics
     
-    def _calculate_stats(self) -> SessionStats:
-        """Calculate comprehensive session statistics."""
+    def _calculate_enhanced_stats(self) -> SessionStats:
+        """Calculate comprehensive session statistics with enhanced data."""
         if not self.sessions:
             return SessionStats(
                 total_sessions=0,
@@ -523,7 +691,8 @@ class GameSessionManager:
                 sessions_by_status={},
                 completed_games=0,
                 average_session_age_hours=0.0,
-                oldest_session_hours=0.0
+                oldest_session_hours=0.0,
+                events_today=self._events_today
             )
         
         sessions_by_type = {}
@@ -537,7 +706,7 @@ class GameSessionManager:
             game_type = session.game_type
             sessions_by_type[game_type] = sessions_by_type.get(game_type, 0) + 1
             
-            # Count by status
+            # Determine status more accurately
             if session.is_completed():
                 status = "completed"
                 completed_count += 1
@@ -564,25 +733,16 @@ class GameSessionManager:
             sessions_by_status=sessions_by_status,
             completed_games=completed_count,
             average_session_age_hours=average_age_hours,
-            oldest_session_hours=oldest_age_hours
+            oldest_session_hours=oldest_age_hours,
+            events_today=self._events_today
         )
     
-    # ================================================================== Utility Methods
+    # Legacy method for backward compatibility
+    def _calculate_stats(self) -> SessionStats:
+        """Legacy method - calls enhanced stats."""
+        return self._calculate_enhanced_stats()
     
-    def _generate_session_id(self, game_type: str) -> str:
-        """Generate a unique session ID."""
-        timestamp = datetime.now().strftime("%H%M%S")
-        random_part = uuid.uuid4().hex[:4]
-        base_id = f"{game_type}_{timestamp}_{random_part}"
-        
-        # Ensure uniqueness
-        counter = 0
-        session_id = base_id
-        while session_id in self.sessions:
-            counter += 1
-            session_id = f"{base_id}_{counter}"
-        
-        return session_id
+    # ================================================================== Utility Methods
     
     def _select_new_active_session(self) -> Optional[str]:
         """Select a new active session (most recently accessed)."""
@@ -624,11 +784,11 @@ class GameSessionManager:
         """Get stale sessions (old and not recently accessed)."""
         return [session for session in self.sessions.values() if session.is_stale(hours)]
     
-    # ================================================================== Health & Monitoring
+    # ================================================================== Enhanced Health & Monitoring
     
     def get_health_status(self) -> dict:
-        """Get health status of the session manager."""
-        stats = self._calculate_stats()
+        """Get enhanced health status with event tracking."""
+        stats = self._calculate_enhanced_stats()
         
         return {
             "status": "healthy" if len(self.sessions) < self._max_sessions * 0.9 else "warning",
@@ -638,5 +798,7 @@ class GameSessionManager:
             "active_session": self.active_session_id,
             "uptime_hours": (datetime.now() - self.start_time).total_seconds() / 3600,
             "oldest_session_hours": stats.oldest_session_hours,
-            "stale_sessions": len(self.get_stale_sessions())
+            "stale_sessions": len(self.get_stale_sessions()),
+            "events_today": self._events_today,
+            "event_handler_active": self.event_handler is not None
         }

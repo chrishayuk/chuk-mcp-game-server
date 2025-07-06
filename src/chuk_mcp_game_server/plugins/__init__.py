@@ -108,6 +108,97 @@ def create_plugin_registry(auto_discover: bool = False,
     return registry
 
 
+def create_empty_registry() -> PluginRegistry:
+    """Create an empty plugin registry."""
+    return PluginRegistry()
+
+
+def load_plugins_from_list(plugin_modules: list, 
+                          package_prefix: str = "games") -> PluginRegistry:
+    """
+    Load plugins from a list of module names.
+    
+    Args:
+        plugin_modules: List of module names to load
+        package_prefix: Package prefix for module resolution
+    
+    Returns:
+        PluginRegistry: Registry with loaded plugins
+    """
+    return discover_plugins(plugin_modules, package_prefix)
+
+
+def validate_plugin(plugin: GamePlugin) -> tuple[bool, str]:
+    """
+    Validate a plugin implementation.
+    
+    Args:
+        plugin: Plugin instance to validate
+    
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    try:
+        # Check required methods are implemented
+        game_type = plugin.get_game_type()
+        if not game_type or not isinstance(game_type, str):
+            return False, "get_game_type() must return a non-empty string"
+        
+        game_info = plugin.get_game_info()
+        if not game_info:
+            return False, "get_game_info() must return a GameInfo instance"
+        
+        config_model = plugin.get_config_model()
+        if not config_model:
+            return False, "get_config_model() must return a Pydantic model class"
+        
+        state_model = plugin.get_state_model()
+        if not state_model:
+            return False, "get_state_model() must return a Pydantic model class"
+        
+        # Test schema generation
+        schema = plugin.get_json_schema()
+        if not isinstance(schema, dict):
+            return False, "get_json_schema() must return a dictionary"
+        
+        return True, "Plugin validation successful"
+        
+    except Exception as e:
+        return False, f"Plugin validation failed: {str(e)}"
+
+
+def get_plugin_info(plugin: GamePlugin) -> dict:
+    """
+    Get comprehensive information about a plugin.
+    
+    Args:
+        plugin: Plugin instance
+    
+    Returns:
+        dict: Plugin information dictionary
+    """
+    try:
+        game_info = plugin.get_game_info()
+        return {
+            "game_type": plugin.get_game_type(),
+            "name": game_info.name,
+            "description": game_info.description,
+            "category": game_info.category,
+            "version": game_info.version,
+            "author": game_info.author,
+            "features": game_info.features,
+            "min_players": game_info.min_players,
+            "max_players": game_info.max_players,
+            "complexity_score": game_info.complexity_score,
+            "estimated_duration_minutes": game_info.estimated_duration_minutes,
+            "config_schema": plugin.get_json_schema()
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to get plugin info: {str(e)}"
+        }
+
+
 # Package information
 PACKAGE_INFO = {
     "name": "chuk_mcp_game_server.plugins",
@@ -119,7 +210,9 @@ PACKAGE_INFO = {
         "Dynamic plugin loading from modules",
         "Plugin discovery utilities",
         "Type-safe plugin interfaces",
-        "Comprehensive error handling"
+        "Comprehensive error handling",
+        "Plugin validation and information extraction",
+        "JSON schema generation for configurations"
     ],
     "dependencies": [
         "typing",
@@ -135,3 +228,71 @@ def get_package_info():
 def get_version():
     """Get package version."""
     return __version__
+
+def list_plugin_requirements():
+    """Get list of requirements for implementing a plugin."""
+    return [
+        "Inherit from GamePlugin abstract base class",
+        "Implement get_game_type() -> str",
+        "Implement get_game_info() -> GameInfo", 
+        "Implement get_config_model() -> Type[GameConfig]",
+        "Implement get_state_model() -> Type[GameStateBase]",
+        "Implement create_initial_state(game_id, config) -> GameStateBase",
+        "Optional: Override validate_config() for custom validation",
+        "Optional: Override get_json_schema() for custom schema"
+    ]
+
+def get_plugin_template():
+    """Get a template for implementing a new plugin."""
+    return '''
+from chuk_mcp_game_server.plugins import GamePlugin
+from chuk_mcp_game_server.core import (
+    GameStateBase, GameConfig, GameInfo, 
+    GameCategory, DifficultyLevel, GameFeature
+)
+from typing import Type
+from pydantic import Field
+
+class MyGameState(GameStateBase):
+    """State model for your game."""
+    # Add your game-specific state fields here
+    pass
+
+class MyGameConfig(GameConfig):
+    """Configuration model for your game.""" 
+    # Add your game-specific config fields here
+    pass
+
+class MyGamePlugin(GamePlugin):
+    """Plugin implementation for your game."""
+    
+    def get_game_type(self) -> str:
+        return "my_game"
+    
+    def get_game_info(self) -> GameInfo:
+        return GameInfo(
+            name="My Game",
+            description="Description of your game",
+            category=GameCategory.DEMO,
+            difficulty=DifficultyLevel.MEDIUM,
+            features=[GameFeature.SINGLE_PLAYER],
+            version="1.0.0",
+            author="Your Name"
+        )
+    
+    def get_config_model(self) -> Type[GameConfig]:
+        return MyGameConfig
+    
+    def get_state_model(self) -> Type[GameStateBase]:
+        return MyGameState
+    
+    def create_initial_state(self, game_id: str, config: GameConfig) -> GameStateBase:
+        return MyGameState(
+            game_id=game_id,
+            game_type=self.get_game_type()
+        )
+
+# Plugin factory function
+def create_plugin() -> GamePlugin:
+    return MyGamePlugin()
+'''

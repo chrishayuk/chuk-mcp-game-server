@@ -1,14 +1,21 @@
 # chuk_mcp_game_server/session/models.py
 """
-Session Models
-==============
+Session Models - Enhanced (COMPLETELY FIXED)
+============================================
 
 Pydantic models specific to session management.
+Enhanced with event system, better enum handling, and improved features.
 Updated to work with separated GameSession and GameSessionManager architecture
 and migrated to Pydantic v2.
+
+FIXED ISSUES:
+- Event system enum handling (no more 'str' object has no attribute 'value' errors)
+- Proper enum serialization and deserialization
+- Enhanced type safety for event handling
+- All enum fields now use string types with proper validation
 """
 
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Callable, Awaitable
 from datetime import datetime, timedelta
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -34,6 +41,8 @@ class OperationType(str, Enum):
     CLEANUP = "cleanup"
     BULK_DELETE = "bulk_delete"
     BULK_TAG = "bulk_tag"
+    ACTIVATE = "activate"
+    COMPLETE = "complete"
 
 
 class FilterOperator(str, Enum):
@@ -47,10 +56,91 @@ class FilterOperator(str, Enum):
     NOT_IN = "not_in"
 
 
-# ================================================================== Core Session Models
+class EventType(str, Enum):
+    """Session event types."""
+    SESSION_CREATED = "session_created"
+    SESSION_UPDATED = "session_updated"
+    SESSION_DELETED = "session_deleted"
+    SESSION_COMPLETED = "session_completed"
+    SESSION_ACTIVATED = "session_activated"
+    GAME_MOVE_MADE = "game_move_made"
+    CLEANUP_PERFORMED = "cleanup_performed"
+    BULK_OPERATION = "bulk_operation"
+    ERROR_OCCURRED = "error_occurred"
+
+
+# ================================================================== Utility Functions
+
+def safe_enum_to_string(value) -> str:
+    """Safely convert enum or string to string value."""
+    if value is None:
+        return "unknown"
+    
+    # Already a string
+    if isinstance(value, str):
+        # Handle "EnumClass.VALUE" format
+        if '.' in value:
+            return value.split('.')[-1].lower()
+        return value.lower()
+    
+    # Enum instance with .value
+    if hasattr(value, 'value') and value.value is not None:
+        return str(value.value)
+    
+    # Enum instance with .name
+    if hasattr(value, 'name'):
+        return str(value.name).lower()
+    
+    # Enum class name
+    if hasattr(value, '__name__'):
+        return str(value.__name__).lower()
+    
+    # Fallback
+    return str(value).lower()
+
+
+# ================================================================== Event System Models (FIXED)
+
+class SessionEvent(BaseModel):
+    """Session event with bulletproof enum handling."""
+    event_type: str = Field(..., description="Type of event (string value)")
+    session_id: Optional[str] = Field(None, description="Related session ID")
+    timestamp: datetime = Field(default_factory=datetime.now, description="Event timestamp")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Event details")
+    user_id: Optional[str] = Field(None, description="User who triggered the event")
+    source: str = Field(default="session_manager", description="Event source")
+    correlation_id: Optional[str] = Field(None, description="Request correlation ID")
+    
+    model_config = {
+        "json_encoders": {datetime: lambda v: v.isoformat()},
+        "use_enum_values": True
+    }
+    
+    @field_validator('event_type', mode='before')
+    @classmethod
+    def normalize_event_type(cls, v):
+        """Bulletproof validation that handles any input type."""
+        return safe_enum_to_string(v)
+    
+    def add_detail(self, key: str, value: Any):
+        """Add detail to the event."""
+        self.details[key] = value
+    
+    def to_log_message(self) -> str:
+        """Convert to a log-friendly message."""
+        session_part = f" [{self.session_id}]" if self.session_id else ""
+        message = self.details.get('message', 'No details')
+        return f"{self.event_type}{session_part}: {message}"
+
+
+# Event handler type
+EventHandler = Callable[[SessionEvent], Awaitable[None]]
+
+
+# ================================================================== Enhanced Core Session Models (FIXED)
 
 class GameSessionInfo(BaseModel):
-    """Game session information for API responses."""
+    """Enhanced game session information for API responses."""
     session_id: str = Field(..., description="Session identifier")
     game_type: str = Field(..., description="Type of game")
     created_at: datetime = Field(..., description="Creation timestamp")
@@ -58,30 +148,37 @@ class GameSessionInfo(BaseModel):
     tags: List[str] = Field(default_factory=list, description="Session tags")
     is_active: bool = Field(default=False, description="Whether this is the active session")
     is_completed: bool = Field(default=False, description="Whether game is finished")
-    status: SessionStatus = Field(default=SessionStatus.ACTIVE, description="Current session status")
+    status: str = Field(default="active", description="Current session status (string)")
     
     model_config = {
         "json_encoders": {datetime: lambda v: v.isoformat()},
-        "use_enum_values": True
+        "use_enum_values": True,
+        "populate_by_name": True
     }
     
-    @field_validator('status')
+    @field_validator('status', mode='before')
+    @classmethod
+    def normalize_status(cls, v):
+        """Normalize status to string value."""
+        return safe_enum_to_string(v) if v else "active"
+    
+    @field_validator('status', mode='after')
     @classmethod
     def determine_status(cls, v, info):
         """Automatically determine status based on other fields."""
         if info.data and info.data.get('is_completed'):
-            return SessionStatus.COMPLETED
+            return "completed"
         
         # Calculate if session is idle/stale based on last_accessed
         last_accessed = info.data.get('last_accessed') if info.data else None
         if last_accessed:
             idle_hours = (datetime.now() - last_accessed).total_seconds() / 3600
             if idle_hours > 24:  # Stale after 24 hours
-                return SessionStatus.STALE
+                return "stale"
             elif idle_hours > 2:  # Idle after 2 hours
-                return SessionStatus.IDLE
+                return "idle"
         
-        return SessionStatus.ACTIVE
+        return "active"
     
     @property
     def age_seconds(self) -> float:
@@ -108,7 +205,7 @@ class SessionSummary(BaseModel):
     """Compact session summary for lists and overviews."""
     session_id: str = Field(..., description="Session identifier")
     game_type: str = Field(..., description="Type of game")
-    status: SessionStatus = Field(..., description="Current status")
+    status: str = Field(..., description="Current status (string value)")
     tags: List[str] = Field(default_factory=list, description="Session tags")
     age_hours: float = Field(..., ge=0, description="Session age in hours")
     idle_hours: float = Field(..., ge=0, description="Idle time in hours")
@@ -117,9 +214,15 @@ class SessionSummary(BaseModel):
     model_config = {
         "use_enum_values": True
     }
+    
+    @field_validator('status', mode='before')
+    @classmethod
+    def normalize_status(cls, v):
+        """Normalize status to string value."""
+        return safe_enum_to_string(v)
 
 
-# ================================================================== Statistics Models
+# ================================================================== Enhanced Statistics Models
 
 class SessionTypeStats(BaseModel):
     """Statistics for a specific game type."""
@@ -144,7 +247,7 @@ class SessionTypeStats(BaseModel):
 
 
 class SessionStats(BaseModel):
-    """Comprehensive session statistics."""
+    """Enhanced comprehensive session statistics."""
     total_sessions: int = Field(..., ge=0, description="Total number of sessions")
     active_session: Optional[str] = Field(None, description="Currently active session ID")
     sessions_by_type: Dict[str, int] = Field(..., description="Session count by game type")
@@ -153,6 +256,7 @@ class SessionStats(BaseModel):
     average_session_age_hours: float = Field(..., ge=0, description="Average session age in hours")
     oldest_session_hours: float = Field(..., ge=0, description="Age of oldest session in hours")
     type_stats: List[SessionTypeStats] = Field(default_factory=list, description="Per-type statistics")
+    events_today: int = Field(default=0, ge=0, description="Events triggered today")
     
     model_config = {
         "use_enum_values": True
@@ -180,7 +284,7 @@ class SessionStats(BaseModel):
         return (self.completed_games / self.total_sessions) * 100
 
 
-# ================================================================== Filter Models
+# ================================================================== Enhanced Filter Models (FIXED)
 
 class SessionFilter(BaseModel):
     """Advanced filters for session queries."""
@@ -188,8 +292,8 @@ class SessionFilter(BaseModel):
     game_types: List[str] = Field(default_factory=list, description="Filter by multiple game types")
     tags: List[str] = Field(default_factory=list, description="Filter by tags (OR logic)")
     tags_all: List[str] = Field(default_factory=list, description="Filter by tags (AND logic)")
-    status: Optional[SessionStatus] = Field(None, description="Filter by status")
-    statuses: List[SessionStatus] = Field(default_factory=list, description="Filter by multiple statuses")
+    status: Optional[str] = Field(None, description="Filter by status (string value)")
+    statuses: List[str] = Field(default_factory=list, description="Filter by multiple statuses")
     include_completed: bool = Field(default=True, description="Include completed games")
     min_age_hours: Optional[float] = Field(None, ge=0, description="Minimum session age in hours")
     max_age_hours: Optional[float] = Field(None, ge=0, description="Maximum session age in hours")
@@ -202,6 +306,20 @@ class SessionFilter(BaseModel):
     model_config = {
         "use_enum_values": True
     }
+    
+    @field_validator('status', mode='before')
+    @classmethod
+    def normalize_status(cls, v):
+        """Normalize status to string value."""
+        return safe_enum_to_string(v) if v else None
+    
+    @field_validator('statuses', mode='before')
+    @classmethod
+    def normalize_statuses(cls, v):
+        """Normalize statuses list to string values."""
+        if not v:
+            return []
+        return [safe_enum_to_string(status) for status in v]
     
     @field_validator('max_age_hours')
     @classmethod
@@ -252,15 +370,17 @@ class SessionSortOptions(BaseModel):
         return v
 
 
-# ================================================================== Request/Response Models
+# ================================================================== Enhanced Request/Response Models
 
 class SessionCreationRequest(BaseModel):
-    """Request to create a new session."""
+    """Enhanced request to create a new session."""
     game_type: str = Field(..., description="Type of game to create")
     session_id: Optional[str] = Field(None, description="Optional custom session ID")
     tags: List[str] = Field(default_factory=list, description="Session tags")
     config: Dict[str, Any] = Field(default_factory=dict, description="Game-specific configuration")
     auto_activate: bool = Field(default=True, description="Set as active session if created")
+    emit_events: bool = Field(default=True, description="Whether to emit creation events")
+    correlation_id: Optional[str] = Field(None, description="Request correlation ID")
     
     @field_validator('tags')
     @classmethod
@@ -298,6 +418,10 @@ class SessionListResponse(BaseModel):
     filter_applied: Optional[SessionFilter] = Field(None, description="Filter that was applied")
     sort_applied: Optional[SessionSortOptions] = Field(None, description="Sort that was applied")
     
+    model_config = {
+        "use_enum_values": True
+    }
+    
     @field_validator('filtered_count')
     @classmethod
     def validate_filtered_count(cls, v, info):
@@ -334,30 +458,43 @@ class SessionUpdateRequest(BaseModel):
         return self
 
 
-# ================================================================== Operation Models
+# ================================================================== Enhanced Operation Models (FIXED)
 
 class SessionOperation(BaseModel):
-    """Record of a session operation."""
-    operation_type: OperationType = Field(..., description="Type of operation")
+    """Enhanced record of a session operation with event correlation."""
+    operation_type: str = Field(..., description="Type of operation (string value)")
     session_id: str = Field(..., description="Target session ID")
     timestamp: datetime = Field(default_factory=datetime.now, description="Operation timestamp")
     success: bool = Field(..., description="Whether operation succeeded")
     message: Optional[str] = Field(None, description="Operation message")
     details: Optional[Dict[str, Any]] = Field(None, description="Additional operation details")
     duration_ms: Optional[float] = Field(None, ge=0, description="Operation duration in milliseconds")
+    event_id: Optional[str] = Field(None, description="Related event ID")
     
     model_config = {
         "json_encoders": {datetime: lambda v: v.isoformat()},
         "use_enum_values": True
     }
+    
+    @field_validator('operation_type', mode='before')
+    @classmethod
+    def normalize_operation_type(cls, v):
+        """Normalize operation type to string value."""
+        return safe_enum_to_string(v)
 
 
 class SessionBulkOperation(BaseModel):
     """Bulk operation on multiple sessions."""
-    operation: OperationType = Field(..., description="Operation type")
-    session_ids: List[str] = Field(..., min_items=1, description="Session IDs to operate on")
+    operation: str = Field(..., description="Operation type (string value)")
+    session_ids: List[str] = Field(..., min_length=1, description="Session IDs to operate on")
     parameters: Dict[str, Any] = Field(default_factory=dict, description="Operation parameters")
     parallel: bool = Field(default=False, description="Execute operations in parallel")
+    
+    @field_validator('operation', mode='before')
+    @classmethod
+    def normalize_operation(cls, v):
+        """Normalize operation to string value."""
+        return safe_enum_to_string(v)
     
     @field_validator('session_ids')
     @classmethod
@@ -369,16 +506,24 @@ class SessionBulkOperation(BaseModel):
 
 
 class SessionBulkResult(BaseModel):
-    """Result of a bulk operation."""
-    operation: OperationType = Field(..., description="Operation that was performed")
+    """Enhanced result of a bulk operation with event tracking."""
+    operation: str = Field(..., description="Operation that was performed (string value)")
     total_requested: int = Field(..., ge=0, description="Total sessions requested")
     successful: int = Field(..., ge=0, description="Number of successful operations")
     failed: int = Field(..., ge=0, description="Number of failed operations")
     results: List[SessionOperation] = Field(..., description="Individual operation results")
     duration_ms: float = Field(..., ge=0, description="Total operation duration in milliseconds")
+    event_id: Optional[str] = Field(None, description="Bulk operation event ID")
     
-    class Config:
-        use_enum_values = True
+    model_config = {
+        "use_enum_values": True
+    }
+    
+    @field_validator('operation', mode='before')
+    @classmethod
+    def normalize_operation(cls, v):
+        """Normalize operation to string value."""
+        return safe_enum_to_string(v)
     
     @field_validator('successful')
     @classmethod
@@ -399,10 +544,10 @@ class SessionBulkResult(BaseModel):
         return (self.successful / self.total_requested) * 100
 
 
-# ================================================================== Cleanup Models
+# ================================================================== Enhanced Cleanup Models
 
 class CleanupCriteria(BaseModel):
-    """Criteria for session cleanup operations."""
+    """Enhanced criteria for session cleanup operations."""
     max_age_hours: float = Field(24.0, gt=0, description="Maximum session age in hours")
     max_idle_hours: float = Field(12.0, gt=0, description="Maximum idle time in hours")
     keep_completed: bool = Field(default=True, description="Whether to keep completed games")
@@ -410,6 +555,7 @@ class CleanupCriteria(BaseModel):
     keep_tagged: List[str] = Field(default_factory=list, description="Keep sessions with these tags")
     exclude_game_types: List[str] = Field(default_factory=list, description="Game types to exclude from cleanup")
     dry_run: bool = Field(default=False, description="If true, don't actually delete sessions")
+    emit_events: bool = Field(default=True, description="Whether to emit cleanup events")
     
     @field_validator('max_idle_hours')
     @classmethod
@@ -423,7 +569,7 @@ class CleanupCriteria(BaseModel):
 
 
 class CleanupResult(BaseModel):
-    """Result of a cleanup operation."""
+    """Enhanced result of a cleanup operation."""
     sessions_deleted: int = Field(..., ge=0, description="Number of sessions deleted")
     sessions_kept: int = Field(..., ge=0, description="Number of sessions kept")
     deleted_sessions: List[Dict[str, Any]] = Field(..., description="Details of deleted sessions")
@@ -432,6 +578,7 @@ class CleanupResult(BaseModel):
     dry_run: bool = Field(..., description="Whether this was a dry run")
     duration_ms: float = Field(..., ge=0, description="Cleanup operation duration in milliseconds")
     space_freed_estimate: Optional[str] = Field(None, description="Estimated memory/space freed")
+    event_id: Optional[str] = Field(None, description="Cleanup event ID")
     
     @property
     def total_sessions_processed(self) -> int:
@@ -439,10 +586,10 @@ class CleanupResult(BaseModel):
         return self.sessions_deleted + self.sessions_kept
 
 
-# ================================================================== Health & Monitoring
+# ================================================================== Health & Monitoring Models
 
 class SessionManagerHealth(BaseModel):
-    """Health status of the session manager."""
+    """Enhanced health status of the session manager."""
     status: str = Field(..., description="Overall health status")
     total_sessions: int = Field(..., ge=0, description="Current session count")
     max_sessions: int = Field(..., gt=0, description="Maximum allowed sessions")
@@ -453,6 +600,8 @@ class SessionManagerHealth(BaseModel):
     stale_sessions_count: int = Field(..., ge=0, description="Number of stale sessions")
     memory_pressure: bool = Field(default=False, description="Whether under memory pressure")
     recommendations: List[str] = Field(default_factory=list, description="Health recommendations")
+    events_today: int = Field(default=0, ge=0, description="Events triggered today")
+    event_handler_active: bool = Field(default=False, description="Whether event handler is active")
     
     @field_validator('status')
     @classmethod
@@ -505,3 +654,18 @@ class SessionQueryResult(BaseModel):
     def is_complete_result(self) -> bool:
         """Whether this result contains all matching sessions."""
         return not self.has_more
+
+
+# ================================================================== Backward Compatibility Functions
+
+def normalize_event_type(event_type) -> str:
+    """Utility function to normalize event types to string values."""
+    return safe_enum_to_string(event_type)
+
+def normalize_operation_type(operation_type) -> str:
+    """Utility function to normalize operation types to string values."""
+    return safe_enum_to_string(operation_type)
+
+def normalize_session_status(status) -> str:
+    """Utility function to normalize session status to string values."""
+    return safe_enum_to_string(status)
